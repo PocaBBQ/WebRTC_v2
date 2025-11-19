@@ -1,617 +1,936 @@
-#!/usr/bin/env python3
 """
-pc_stream.py - Streamer (full)
+Streamer with aspect-ratio-preserving scaling + padding and dynamic quality switching.
+Optimized: reuses ScaledVideoTrack instances per (width x height @ fps) to reduce memory/CPU when multiple viewers
+request the same quality, and additionally pools MediaRelay subscriptions to reduce memory usage on long runs / many reconnects.
 
-Features included:
-- Auto-detect camera device path (v4l2-ctl or /dev)
-- Parse capabilities via v4l2-ctl (only keep fps >= 15)
-- Choose reasonable default camera mode (prefer 1280x720@30)
-- Single camera capture handle, background reader keeps only latest frame
-- Throttle capture thread to target FPS to reduce CPU
-- MediaRelay to serve multiple viewers with low-latency frames
-- Robust normalization of ICE candidates before calling pc.addIceCandidate()
-- Announce caps to signaling server during register
-
-Environment:
-  SIGNALING_SERVER (optional) - default ws://localhost:8000/ws
-  STREAMER_ID (optional) - default streamer-01
-  DEVICE_PATH (optional) - e.g. /dev/video0
-  FORCE_WIDTH / FORCE_HEIGHT / FORCE_FPS (optional) - force default capture mode
-
-Usage:
-  export FORCE_WIDTH=640 FORCE_HEIGHT=360 FORCE_FPS=15
-  python3 pc_stream.py
+Features:
+- Device auto-detect (keywords: logitech, c930e)
+- Parse v4l2 caps and keep resolutions with FPS >= FPS_MIN (default 30)
+- Pool ScaledVideoTrack per settings key (e.g., "1280x720@30")
+- Pool MediaRelay.subscribe(player.video) per settings key to avoid creating too many underlying sources
+- Provide per-viewer RTCPeerConnection; reuse pooled tracks when possible
+- Support dynamic update: viewer sends a 'request' message with new settings; streamer replaces sender's track
+- Robust ICE candidate handling and compatibility workarounds for aiortc versions
+- Designed for LAN use (no STUN required on client side)
+Requirements:
+- v4l2-ctl present on system for accurate device caps (fallback provided if not found)
+- numpy and av (PyAV) installed
+- aiortc, aiohttp installed
 """
+
 import asyncio
+import inspect
 import json
-import os
+import logging
 import re
+import shlex
+import shutil
+import signal
 import subprocess
+import sys
 import time
-import threading
-import cv2
+from typing import Any, Dict, List, Optional
+
+import aiohttp
+import av
 import numpy as np
-from fractions import Fraction
+from aiortc import RTCPeerConnection, RTCSessionDescription, VideoStreamTrack
+from aiortc.contrib.media import MediaPlayer, MediaRelay
 
-from aiortc import RTCPeerConnection, RTCSessionDescription
-from aiortc.mediastreams import VideoStreamTrack
-from aiortc.contrib.media import MediaRelay
-from av import VideoFrame
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("pc_stream")
 
-import websockets
+# ---------- Config ----------
+SIGNALING_URL = "ws://localhost:8000/ws"
+STREAMER_ID = "streamer-01"
 
-# ========== CONFIG ==========
-SIGNALING_SERVER = os.getenv("SIGNALING_SERVER", "ws://localhost:8000/ws")
-STREAMER_ID = os.getenv("STREAMER_ID", "streamer-01")
-DEVICE_PATH = os.getenv("DEVICE_PATH")  # if provided, use it
-# ============================
+DEVICE_KEYWORDS = ("logitech", "c930e")
+FPS_MIN = 30  # keep only fps >= FPS_MIN in caps
+DEFAULT_WIDTH = 1280
+DEFAULT_HEIGHT = 720
+DEFAULT_FPS = 30
+DEVICE = "/dev/video0"
+# ----------------------------
 
-# -------------------------
-# Device detection helpers
-# -------------------------
-def find_camera_device_by_v4l2():
-    """Try to parse `v4l2-ctl --list-devices` and return first /dev/video* (prefer Logitech)."""
-    try:
-        res = subprocess.run(["v4l2-ctl", "--list-devices"], capture_output=True, text=True, check=True)
-        out = res.stdout
-    except Exception:
-        return None
+# Globals
+player: Optional[MediaPlayer] = None
+relay: Optional[MediaRelay] = None
+pcs: Dict[str, RTCPeerConnection] = {}
+senders: Dict[str, Any] = {}  # store RTCRtpSender for each viewer id
+DEVICE_CAPS: List[Dict[str, Any]] = []
 
-    blocks = []
-    cur_name = None
-    cur_devs = []
-    for line in out.splitlines():
-        if line.strip() == "":
-            if cur_name:
-                blocks.append((cur_name, cur_devs))
-                cur_name = None
-                cur_devs = []
-            continue
-        if not line.startswith("\t") and not line.startswith(" "):
-            if cur_name:
-                blocks.append((cur_name, cur_devs))
-            cur_name = line.strip()
-            cur_devs = []
-        else:
-            dev = line.strip()
-            if os.path.exists(dev):
-                cur_devs.append(dev)
-    if cur_name:
-        blocks.append((cur_name, cur_devs))
+# Pool for ScaledVideoTrack instances keyed by "WxH@FPS"
+track_pool: Dict[str, VideoStreamTrack] = {}
+track_refcount: Dict[str, int] = {}
+viewer_track_key: Dict[str, str] = {}
 
-    # prefer Logitech / C930 etc
-    for name, devs in blocks:
-        ln = name.lower()
-        if "logitech" in ln or "c930" in ln or "c930e" in ln:
-            if devs:
-                return devs[0]
-    # fallback first found
-    for _, devs in blocks:
-        if devs:
-            return devs[0]
-    return None
+# Pool for MediaRelay subscriptions keyed by "WxH@FPS"
+# (this limits number of underlying sources and helps memory stability)
+video_source_pool: Dict[str, Any] = {}
 
-def find_camera_device_fallback():
-    """Check /dev/video0..7 for existing device."""
-    for i in range(0, 8):
-        p = f"/dev/video{i}"
-        if os.path.exists(p):
-            return p
-    return None
 
-def detect_camera_device(preferred=None):
-    """Return device path string like /dev/video0 or None."""
-    if preferred and os.path.exists(preferred):
-        return preferred
-    dev = find_camera_device_by_v4l2()
-    if dev:
-        print("Auto-detected camera device via v4l2-ctl:", dev)
-        return dev
-    dev2 = find_camera_device_fallback()
-    if dev2:
-        print("Auto-detected camera device via /dev scan:", dev2)
-        return dev2
-    return None
+# ---------- helpers ----------
+def _inc_track_ref(key: str) -> None:
+    """Increase refcount for a pooled track key and log it."""
+    current = track_refcount.get(key, 0) + 1
+    track_refcount[key] = current
+    logger.debug("Track %s refcount -> %d", key, current)
 
-# -------------------------
-# v4l2 caps parsing (keep fps >= 15 only)
-# -------------------------
-def detect_v4l2_caps(device="/dev/video0"):
+
+def _dec_track_ref(key: str) -> None:
     """
-    Use `v4l2-ctl --device device --list-formats-ext` to parse supported resolutions and fps.
-    Only keep resolutions that support fps >= 15.
-    Returns list of dicts: [{width, height, fps_list}, ...]
+    Decrease refcount, and drop from pools when refcount reaches zero.
+    Also stops tracks and underlying sources to free memory.
     """
-    try:
-        result = subprocess.run(
-            ["v4l2-ctl", "--device", device, "--list-formats-ext"],
-            capture_output=True, text=True, check=True
-        )
-    except Exception as e:
-        print("v4l2-ctl failed:", e)
-        return []
+    global track_pool, video_source_pool
 
-    lines = result.stdout.splitlines()
-    caps = []
-    cur_w = cur_h = None
-    fps_list = []
-    size_re = re.compile(r"Size:\s+Discrete\s+(\d+)x(\d+)")
-    fps_re = re.compile(r"Interval:\s+Discrete\s+[0-9.]+s\s+\(([0-9.]+)\s+fps\)")
+    if key not in track_refcount:
+        return
+    current = track_refcount[key] - 1
+    if current <= 0:
+        logger.info("No more users for track %s, removing from pool", key)
+        track_refcount.pop(key, None)
 
-    for line in lines:
-        sm = size_re.search(line)
-        fm = fps_re.search(line)
-        if sm:
-            # flush previous block
-            if cur_w and cur_h and fps_list:
-                filtered = [f for f in set(fps_list) if f >= 15]
-                if filtered:
-                    caps.append({
-                        "width": int(cur_w),
-                        "height": int(cur_h),
-                        "fps_list": sorted(filtered, reverse=True)
-                    })
-                fps_list = []
-            cur_w, cur_h = sm.groups()
-            continue
-        if fm and cur_w and cur_h:
+        track = track_pool.pop(key, None)
+        if track is not None and hasattr(track, "stop"):
             try:
-                fps_val = float(fm.group(1))
-                fps_list.append(round(fps_val))
+                track.stop()
+            except Exception:
+                logger.exception("Error stopping track %s", key)
+
+        source = video_source_pool.pop(key, None)
+        if source is not None and hasattr(source, "stop"):
+            try:
+                source.stop()
+            except Exception:
+                logger.exception("Error stopping video source %s", key)
+    else:
+        track_refcount[key] = current
+        logger.debug("Track %s refcount -> %d", key, current)
+
+
+def run_cmd(cmd: str) -> str:
+    try:
+        out = subprocess.check_output(
+            shlex.split(cmd), stderr=subprocess.STDOUT
+        ).decode(errors="ignore")
+        return out
+    except subprocess.CalledProcessError as e:
+        logger.debug(
+            "Command failed: %s -> %s",
+            cmd,
+            e.output.decode(errors="ignore"),
+        )
+        return ""
+    except FileNotFoundError:
+        logger.debug("Command missing: %s", cmd)
+        return ""
+
+
+def list_v4l2_devices() -> List[Dict[str, Any]]:
+    if not shutil.which("v4l2-ctl"):
+        logger.warning("v4l2-ctl not found")
+        return []
+    out = run_cmd("v4l2-ctl --list-devices")
+    devices = []
+    if not out:
+        return devices
+    lines = out.splitlines()
+    i = 0
+    while i < len(lines):
+        name = lines[i].strip()
+        if not name.endswith(":"):
+            i += 1
+            continue
+        name = name[:-1].strip()
+        i += 1
+        nodes = []
+        while i < len(lines) and lines[i].startswith("\t"):
+            nodes.append(lines[i].strip())
+            i += 1
+        devices.append({"name": name, "nodes": nodes})
+    return devices
+
+
+def choose_device_by_keyword(
+    devices: List[Dict[str, Any]], keywords=DEVICE_KEYWORDS
+) -> Optional[str]:
+    for dev in devices:
+        lname = dev["name"].lower()
+        for kw in keywords:
+            if kw in lname and dev["nodes"]:
+                return dev["nodes"][0]
+    if devices and devices[0]["nodes"]:
+        return devices[0]["nodes"][0]
+    return None
+
+
+def parse_v4l2_formats(output: str) -> List[Dict[str, Any]]:
+    entries = []
+    width = height = None
+    pixel_format = None
+    fpss: List[int] = []
+    for line in output.splitlines():
+        line = line.strip()
+        m_pf = re.match(r"^\[\d+\]:\s+'?([A-Za-z0-9_]+)'?", line)
+        if m_pf:
+            pixel_format = m_pf.group(1)
+            continue
+        m_size = (
+            re.match(r"^Size:\s*Discrete\s*([0-9]+)x([0-9]+)", line)
+            or re.match(r"^Size:\s*([0-9]+)x([0-9]+)", line)
+            or re.match(r"^([0-9]+)x([0-9]+)", line)
+        )
+        if m_size:
+            if width and height and fpss:
+                fpss_filtered = sorted(
+                    [f for f in set(fpss) if f >= FPS_MIN], reverse=True
+                )
+                if fpss_filtered:
+                    entries.append(
+                        {
+                            "width": width,
+                            "height": height,
+                            "fps_list": fpss_filtered,
+                            "pixel_format": pixel_format,
+                        }
+                    )
+            width = int(m_size.group(1))
+            height = int(m_size.group(2))
+            fpss = []
+            continue
+        m_interval = re.search(r"Interval:.*\(([\d\.]+)\s*fps\)", line)
+        if m_interval:
+            try:
+                fps_val = float(m_interval.group(1))
+                fpss.append(int(round(fps_val)))
+            except Exception:
+                pass
+            continue
+        m_paren = re.search(r"\(([\d\.]+)\s*fps\)", line)
+        if m_paren:
+            try:
+                fps_val = float(m_paren.group(1))
+                fpss.append(int(round(fps_val)))
+            except Exception:
+                pass
+            continue
+    if width and height and fpss:
+        fpss_filtered = sorted(
+            [f for f in set(fpss) if f >= FPS_MIN], reverse=True
+        )
+        if fpss_filtered:
+            entries.append(
+                {
+                    "width": width,
+                    "height": height,
+                    "fps_list": fpss_filtered,
+                    "pixel_format": pixel_format,
+                }
+            )
+    uniq: Dict[tuple, Dict[str, Any]] = {}
+    for e in entries:
+        k = (e["width"], e["height"])
+        if k not in uniq:
+            uniq[k] = {
+                "width": e["width"],
+                "height": e["height"],
+                "fps_list": list(e["fps_list"]),
+                "pixel_format": e.get("pixel_format"),
+            }
+        else:
+            uniq[k]["fps_list"] = sorted(
+                list(set(uniq[k]["fps_list"] + e["fps_list"])), reverse=True
+            )
+    return list(uniq.values())
+
+
+def get_device_caps(dev_node: str) -> List[Dict[str, Any]]:
+    if not shutil.which("v4l2-ctl"):
+        logger.warning("v4l2-ctl not found, returning fallback caps")
+        return [
+            {
+                "width": 1280,
+                "height": 720,
+                "fps_list": [DEFAULT_FPS],
+            },
+            {
+                "width": 640,
+                "height": 480,
+                "fps_list": [DEFAULT_FPS],
+            },
+        ]
+    out = run_cmd(f"v4l2-ctl --list-formats-ext -d {dev_node}")
+    caps = parse_v4l2_formats(out)
+    if not caps:
+        return [
+            {
+                "width": 1280,
+                "height": 720,
+                "fps_list": [DEFAULT_FPS],
+            },
+            {
+                "width": 640,
+                "height": 480,
+                "fps_list": [DEFAULT_FPS],
+            },
+        ]
+    return caps
+
+
+class ParsedIceCandidate:
+    def __init__(self, cand_dict: dict):
+        self.sdpMid = cand_dict.get("sdpMid")
+        self.sdpMLineIndex = cand_dict.get("sdpMLineIndex")
+        self.candidate = cand_dict.get("candidate")
+
+        self.foundation = None
+        self.component = None
+        self.protocol = None
+        self.priority = None
+        self.ip = None
+        self.port = None
+        self.typ = None
+        self.type = None
+        self.relatedAddress = None
+        self.relatedPort = None
+        self.related_address = None
+        self.related_port = None
+        self.tcptype = None
+        self.tcpType = None
+
+        if isinstance(self.candidate, str) and self.candidate.startswith(
+            "candidate:"
+        ):
+            try:
+                parts = self.candidate[len("candidate:") :].split()
+                if len(parts) >= 8:
+                    self.foundation = parts[0]
+                    try:
+                        self.component = int(parts[1])
+                    except Exception:
+                        self.component = parts[1]
+                    self.protocol = parts[2].lower()
+                    try:
+                        self.priority = int(parts[3])
+                    except Exception:
+                        self.priority = parts[3]
+                    self.ip = parts[4]
+                    try:
+                        self.port = int(parts[5])
+                    except Exception:
+                        self.port = parts[5]
+                    if parts[6] == "typ" and len(parts) >= 8:
+                        self.typ = parts[7]
+                        self.type = self.typ
+                    idx = 8
+                    while idx < len(parts):
+                        token = parts[idx]
+                        if token == "raddr" and idx + 1 < len(parts):
+                            self.relatedAddress = parts[idx + 1]
+                            self.related_address = parts[idx + 1]
+                            idx += 2
+                            continue
+                        if token == "rport" and idx + 1 < len(parts):
+                            try:
+                                self.relatedPort = int(parts[idx + 1])
+                                self.related_port = self.relatedPort
+                            except Exception:
+                                self.relatedPort = parts[idx + 1]
+                                self.related_port = parts[idx + 1]
+                            idx += 2
+                            continue
+                        if token == "tcptype" and idx + 1 < len(parts):
+                            self.tcptype = parts[idx + 1]
+                            self.tcpType = parts[idx + 1]
+                            idx += 2
+                            continue
+                        if idx + 1 < len(parts):
+                            idx += 2
+                        else:
+                            idx += 1
+            except Exception:
+                logger.debug(
+                    "Failed parsing candidate string", exc_info=True
+                )
+
+
+def scale_and_pad_frame(
+    src_frame: av.VideoFrame, target_w: int, target_h: int
+) -> av.VideoFrame:
+    src_w = src_frame.width
+    src_h = src_frame.height
+    if src_w == 0 or src_h == 0:
+        return src_frame
+
+    src_ar = src_w / src_h
+    target_ar = target_w / target_h
+
+    if src_ar > target_ar:
+        new_w = target_w
+        new_h = int(round(target_w / src_ar))
+    else:
+        new_h = target_h
+        new_w = int(round(target_h * src_ar))
+
+    if new_w <= 0:
+        new_w = 1
+    if new_h <= 0:
+        new_h = 1
+
+    try:
+        scaled = src_frame.reformat(
+            width=new_w, height=new_h, format="rgb24"
+        )
+    except Exception:
+        scaled = src_frame.reformat(
+            width=new_w, height=new_h, format="rgb24"
+        )
+
+    arr = scaled.to_ndarray(format="rgb24")
+    canvas = np.zeros((target_h, target_w, 3), dtype=np.uint8)
+    y0 = (target_h - new_h) // 2
+    x0 = (target_w - new_w) // 2
+    canvas[y0 : y0 + new_h, x0 : x0 + new_w, :] = arr
+    out_frame = av.VideoFrame.from_ndarray(canvas, format="rgb24")
+    try:
+        out_frame.pts = src_frame.pts
+        out_frame.time_base = (
+            src_frame.time_base
+            if src_frame.time_base is not None
+            else av.time_base
+        )
+    except Exception:
+        pass
+    return out_frame
+
+
+class ScaledVideoTrack(VideoStreamTrack):
+    def __init__(
+        self, source_track: VideoStreamTrack, width: int, height: int, fps: int
+    ):
+        super().__init__()
+        self.source = source_track
+        self.target_w = int(width)
+        self.target_h = int(height)
+        try:
+            self.fps = int(fps)
+            if self.fps <= 0:
+                self.fps = DEFAULT_FPS
+        except Exception:
+            self.fps = DEFAULT_FPS
+        self.frame_time = 1.0 / self.fps
+        self._last_send = None
+        logger.info(
+            "ScaledVideoTrack init: %dx%d@%d (preserve aspect + pad)",
+            self.target_w,
+            self.target_h,
+            self.fps,
+        )
+
+    async def recv(self):
+        frame = await self.source.recv()
+        try:
+            out_frame = scale_and_pad_frame(
+                frame, self.target_w, self.target_h
+            )
+        except Exception:
+            logger.exception(
+                "scale_and_pad_frame failed, falling back to reformat"
+            )
+            try:
+                out_frame = frame.reformat(
+                    width=self.target_w,
+                    height=self.target_h,
+                    format="rgb24",
+                )
+            except Exception:
+                out_frame = frame
+
+        now = time.time()
+        if self._last_send is None:
+            self._last_send = now
+        else:
+            elapsed = now - self._last_send
+            to_wait = self.frame_time - elapsed
+            if to_wait > 0:
+                await asyncio.sleep(to_wait)
+                self._last_send = time.time()
+            else:
+                self._last_send = now
+        return out_frame
+
+
+async def create_player(
+    dev_node: str,
+    width: int = DEFAULT_WIDTH,
+    height: int = DEFAULT_HEIGHT,
+    fps: int = DEFAULT_FPS,
+):
+    global player, relay
+    if player is not None and relay is not None:
+        return
+    options = {"framerate": str(fps), "video_size": f"{width}x{height}"}
+    logger.info("Opening device %s with options %s", dev_node, options)
+    try:
+        player = MediaPlayer(dev_node, format="v4l2", options=options)
+    except Exception:
+        logger.exception("Failed to open MediaPlayer for %s", dev_node)
+        raise
+    relay = MediaRelay()
+
+
+def pool_key(width: int, height: int, fps: int) -> str:
+    return f"{int(width)}x{int(height)}@{int(fps)}"
+
+
+async def handle_offer(ws, peer_from: str, data: dict, dev_node: str):
+    global video_source_pool
+
+    viewer_id = peer_from
+    logger.info("Handling offer from %s settings: %s", viewer_id, data.get("settings"))
+
+    # If this viewer already has an old PC, close & cleanup before creating a new one
+    old_pc = pcs.get(viewer_id)
+    if old_pc is not None:
+        logger.info("Closing old pc for viewer %s before new offer", viewer_id)
+        try:
+            await old_pc.close()
+        except Exception:
+            logger.exception("Error closing old pc for %s", viewer_id)
+        pcs.pop(viewer_id, None)
+        senders.pop(viewer_id, None)
+        old_key = viewer_track_key.pop(viewer_id, None)
+        if old_key:
+            _dec_track_ref(old_key)
+
+    settings = data.get("settings") or {}
+    width = settings.get("width", DEFAULT_WIDTH)
+    height = settings.get("height", DEFAULT_HEIGHT)
+    fps = settings.get("fps", DEFAULT_FPS)
+
+    if player is None or relay is None:
+        await create_player(
+            dev_node,
+            width=DEFAULT_WIDTH,
+            height=DEFAULT_HEIGHT,
+            fps=DEFAULT_FPS,
+        )
+
+    pc = RTCPeerConnection()
+    pcs[viewer_id] = pc
+
+    @pc.on("iceconnectionstatechange")
+    def on_ice_state_change():
+        logger.info(
+            "[pc:%s] ICE -> %s", viewer_id, pc.iceConnectionState
+        )
+        if pc.iceConnectionState in ("closed", "failed", "disconnected"):
+            async def _close_and_cleanup():
+                try:
+                    await pc.close()
+                except Exception:
+                    pass
+                pcs.pop(viewer_id, None)
+                senders.pop(viewer_id, None)
+                old_key = viewer_track_key.pop(viewer_id, None)
+                if old_key:
+                    _dec_track_ref(old_key)
+            try:
+                asyncio.create_task(_close_and_cleanup())
             except Exception:
                 pass
 
-    # last block
-    if cur_w and cur_h and fps_list:
-        filtered = [f for f in set(fps_list) if f >= 15]
-        if filtered:
-            caps.append({
-                "width": int(cur_w),
-                "height": int(cur_h),
-                "fps_list": sorted(filtered, reverse=True)
-            })
-
-    # normalize fps lists
-    for c in caps:
-        c["fps_list"] = sorted(list(set(int(x) for x in c.get("fps_list", []))), reverse=True)
-
-    print("v4l2-ctl caps (fps>=15 only):", caps)
-    return caps
-
-# -------------------------
-# Fallback OpenCV detection
-# -------------------------
-def detect_opencv_caps(device_index=0):
-    print("Fallback OpenCV detection...")
-    candidates = [(1280,720), (1920,1080), (640,480)]
-    caps = []
-    cap = cv2.VideoCapture(device_index)
-    if not cap.isOpened():
-        print("OpenCV cannot open device", device_index)
-        return caps
-    for w,h in candidates:
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
-        time.sleep(0.1)
-        ret, frame = cap.read()
-        if ret and frame is not None:
-            caps.append({"width": w, "height": h, "fps_list": [30,15]})
-    cap.release()
-    print("OpenCV fallback caps:", caps)
-    return caps
-
-# -------------------------
-# Utilities: sort + choose default
-# -------------------------
-def sort_caps_desc(caps):
-    """Sort caps by area descending and fps lists descending."""
-    if not caps:
-        return caps
-    for c in caps:
-        c["fps_list"] = sorted(list(set(int(x) for x in c.get("fps_list", []))), reverse=True)
-    caps_sorted = sorted(caps, key=lambda x: x["width"] * x["height"], reverse=True)
-    return caps_sorted
-
-def choose_default_mode(caps):
-    """
-    Preference logic:
-    - If env FORCE_WIDTH & FORCE_HEIGHT specified -> use them (and FORCE_FPS if given; else 15)
-    - Prefer 1280x720 with fps >=30 (pick highest fps >=30 on that res)
-    - Else pick largest resolution that has fps >=15 (choose highest fps >=15)
-    - Else fallback to caps[0] highest fps
-    Returns (width, height, fps)
-    """
-    fw = os.getenv("FORCE_WIDTH")
-    fh = os.getenv("FORCE_HEIGHT")
-    ff = os.getenv("FORCE_FPS")
-    if fw and fh:
-        try:
-            w = int(fw); h = int(fh); fps = int(ff) if ff else 15
-            print(f"[config] Default mode forced by env: {w}x{h}@{fps}")
-            return (w, h, fps)
-        except Exception:
-            pass
-
-    if not caps:
-        return (1280, 720, 30)
-
-    # search for 1280x720 first
-    for c in caps:
-        if c["width"] == 1280 and c["height"] == 720:
-            fpss = sorted(c.get("fps_list", []), reverse=True)
-            for f in fpss:
-                if f >= 30:
-                    return (1280, 720, f)
-            if fpss:
-                return (1280, 720, fpss[0])
-
-    # else choose largest with fps >=15
-    for c in caps:
-        fpss = sorted(c.get("fps_list", []), reverse=True)
-        if any(f >= 15 for f in fpss):
-            return (c["width"], c["height"], max(f for f in fpss if f >= 15))
-
-    # fallback to caps[0]
-    c = caps[0]
-    fpss = sorted(c.get("fps_list", []), reverse=True)
-    return (c["width"], c["height"], fpss[0] if fpss else 30)
-
-# -------------------------
-# Low-latency camera track with background reader
-# -------------------------
-class OpenCVCameraTrack(VideoStreamTrack):
-    """
-    Background reader keeps only latest_frame to avoid backlog and reduce latency.
-    Throttles capture to target fps to reduce CPU usage.
-    """
-    def __init__(self, device_index=0, width=640, height=360, fps=15):
-        super().__init__()
-        self.device_index = int(device_index)
-        self.width = int(width)
-        self.height = int(height)
-        self.fps = int(fps)
-
-        # open capture
-        self._cap = cv2.VideoCapture(self.device_index)
-        if not self._cap.isOpened():
-            raise RuntimeError(f"Cannot open camera device index {self.device_index}")
-
-        # set properties (driver may ignore)
-        self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
-        self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
-        try:
-            self._cap.set(cv2.CAP_PROP_FPS, self.fps)
-        except Exception:
-            pass
-
-        self._running = True
-        self._latest_frame = None
-        self._lock = threading.Lock()
-
-        # start background thread
-        self._thread = threading.Thread(target=self._reader_thread, daemon=True)
-        self._thread.start()
-
-        print(f"[camera] opened device_index={self.device_index} {self.width}x{self.height}@{self.fps}")
-
-    def _reader_thread(self):
-        target_interval = 1.0 / max(1, self.fps)
-        next_time = time.time()
-        while self._running:
-            try:
-                ret, frame = self._cap.read()
-                if not ret or frame is None:
-                    time.sleep(0.005)
-                    continue
-                # resize if necessary
-                if frame.shape[1] != self.width or frame.shape[0] != self.height:
-                    frame = cv2.resize(frame, (self.width, self.height))
-                # atomic swap latest_frame (simple reference swap is fine)
-                with self._lock:
-                    self._latest_frame = frame
-            except Exception as e:
-                print("[camera reader] exception:", e)
-                time.sleep(0.02)
-
-            # throttle to target fps
-            next_time += target_interval
-            sleep_for = next_time - time.time()
-            if sleep_for > 0:
-                time.sleep(sleep_for)
-            else:
-                # behind schedule, reset next_time
-                next_time = time.time()
-
-        try:
-            self._cap.release()
-        except Exception:
-            pass
-
-    async def recv(self):
-        # pts in milliseconds and time_base = 1/1000
-        pts = int(time.time() * 1000)
-        time_base = Fraction(1, 1000)
-
-        # wait briefly until frame available
-        wait_until = time.time() + 1.0
-        frame = None
-        while True:
-            with self._lock:
-                if self._latest_frame is not None:
-                    # copy reference to avoid modification while converting
-                    frame = self._latest_frame.copy()
-            if frame is not None:
-                break
-            if time.time() > wait_until:
-                # fallback black frame
-                frame = np.zeros((self.height, self.width, 3), dtype=np.uint8)
-                break
-            await asyncio.sleep(0.005)
-
-        # convert BGR->RGB
-        try:
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        except Exception:
-            rgb = frame[..., ::-1]
-
-        vframe = VideoFrame.from_ndarray(rgb, format="rgb24")
-        vframe.pts = pts
-        vframe.time_base = time_base
-        return vframe
-
-    def stop(self):
-        self._running = False
-        try:
-            self._thread.join(timeout=0.5)
-        except Exception:
-            pass
-        try:
-            self._cap.release()
-        except Exception:
-            pass
-
-# -------------------------
-# Robust candidate normalization
-# -------------------------
-def make_candidate_init_in(cand):
-    """
-    Normalize ICE candidate provided by viewer into RTCIceCandidateInit-like dict.
-    Accepts multiple shapes:
-      - {'candidate': 'candidate:...','sdpMid':'0','sdpMLineIndex':0}
-      - {'candidate': {'candidate': 'candidate:...', 'sdpMid':..., ...}}
-      - sometimes nested or missing fields (we fill defaults)
-    Returns dict or None.
-    """
-    if not cand or not isinstance(cand, dict):
-        return None
-
-    # If the payload itself uses key 'candidate' and that is dict -> unwrap
-    inner = cand.get("candidate")
-    if isinstance(inner, dict):
-        candidate_str = inner.get("candidate")
-        sdpMid = inner.get("sdpMid", cand.get("sdpMid"))
-        sdpMLineIndex = inner.get("sdpMLineIndex", cand.get("sdpMLineIndex"))
-    else:
-        candidate_str = cand.get("candidate")
-        sdpMid = cand.get("sdpMid")
-        sdpMLineIndex = cand.get("sdpMLineIndex")
-
-    # On some clients the whole payload might be under another key
-    # Try common fallbacks
-    if not isinstance(candidate_str, str):
-        # attempt other keys
-        for k in ("candidateStr", "cand", "candidate_string"):
-            if isinstance(cand.get(k), str):
-                candidate_str = cand.get(k)
-                break
-
-    if not isinstance(candidate_str, str):
-        # invalid candidate format
-        # print for debugging
-        print("[candidate] invalid or missing candidate string:", cand)
-        return None
-
-    # ensure candidate string looks like "candidate:..."
-    if not candidate_str.strip().startswith("candidate:"):
-        # sometimes browsers include "a=" prefix; accept common variants
-        if "candidate" not in candidate_str:
-            print("[candidate] candidate string doesn't contain 'candidate':", candidate_str)
-            return None
-
-    # default sdpMid/sdpMLineIndex when missing
-    if sdpMid is None:
-        sdpMid = "0"
-    if sdpMLineIndex is None:
-        # attempt to convert if it's stringable
-        try:
-            sdpMLineIndex = int(cand.get("sdpMLineIndex", 0))
-        except Exception:
-            sdpMLineIndex = 0
-
-    return {
-        "candidate": candidate_str,
-        "sdpMid": str(sdpMid),
-        "sdpMLineIndex": int(sdpMLineIndex)
-    }
-
-# -------------------------
-# WebRTC offer handling
-# -------------------------
-async def handle_offer(pc, offer_sdp, ws, viewer_id, relay, camera_source, video_settings=None):
-    """
-    Set remote description, subscribe to relay (shared camera source), create answer,
-    and send ICE candidates via ws.
-    """
-    if not offer_sdp:
-        print("[handle_offer] empty offer_sdp")
-        return None
-    offer = RTCSessionDescription(sdp=offer_sdp, type="offer")
-    await pc.setRemoteDescription(offer)
-
-    # ensure we send video
-    if not pc.getTransceivers():
-        pc.addTransceiver('video', direction='sendonly')
-
-    # try to subscribe to relay; fallback to new track if necessary
     try:
-        track = relay.subscribe(camera_source)
-        pc.addTrack(track)
-    except Exception as e:
-        print("[handle_offer] relay.subscribe failed:", e)
-        # fallback: create a temporary track with requested settings (less optimal)
-        width = int(video_settings.get("width", 1280)) if video_settings else 1280
-        height = int(video_settings.get("height", 720)) if video_settings else 720
-        fps = int(video_settings.get("fps", 30)) if video_settings else 30
-        print("[handle_offer] fallback creating local track", width, height, fps)
-        pc.addTrack(OpenCVCameraTrack(device_index=camera_source.device_index if hasattr(camera_source, 'device_index') else 0,
-                                      width=width, height=height, fps=fps))
+        offer = RTCSessionDescription(sdp=data["sdp"], type=data["type"])
+        await pc.setRemoteDescription(offer)
+    except Exception:
+        logger.exception("Failed to set remote desc for %s", viewer_id)
+        try:
+            await ws.send_json(
+                {
+                    "type": "error",
+                    "to": viewer_id,
+                    "message": "server failed setRemoteDescription",
+                }
+            )
+        except Exception:
+            pass
+        return
 
-    @pc.on("icecandidate")
-    def on_icecandidate(candidate):
-        if candidate is None:
-            return
-        cand = {
-            "candidate": getattr(candidate, "candidate", None),
-            "sdpMid": getattr(candidate, "sdpMid", None),
-            "sdpMLineIndex": getattr(candidate, "sdpMLineIndex", None)
+    # Acquire or create pooled scaled track + pooled relay source
+    key = pool_key(width, height, fps)
+    try:
+        if key in track_pool:
+            scaled = track_pool[key]
+            logger.info(
+                "Reusing ScaledVideoTrack from pool for %s -> %s",
+                viewer_id,
+                key,
+            )
+        else:
+            if key not in video_source_pool:
+                video_source_pool[key] = relay.subscribe(player.video)
+            source = video_source_pool[key]
+            scaled = ScaledVideoTrack(
+                source, width=width, height=height, fps=fps
+            )
+            track_pool[key] = scaled
+            logger.info(
+                "Created ScaledVideoTrack and stored in pool: %s", key
+            )
+        _inc_track_ref(key)
+        viewer_track_key[viewer_id] = key
+    except Exception:
+        logger.exception(
+            "Failed to create/subscribe scaled track for %s", viewer_id
+        )
+        return
+
+    try:
+        sender = pc.addTrack(scaled)
+        senders[viewer_id] = sender
+        logger.info(
+            "Added track for %s -> %dx%d@%d (sender stored)",
+            viewer_id,
+            width,
+            height,
+            fps,
+        )
+    except Exception:
+        logger.exception("Error adding track for %s", viewer_id)
+
+    try:
+        answer = await pc.createAnswer()
+        await pc.setLocalDescription(answer)
+    except Exception:
+        logger.exception("Failed create/set answer for %s", viewer_id)
+        try:
+            await ws.send_json(
+                {
+                    "type": "error",
+                    "to": viewer_id,
+                    "message": "server failed createAnswer",
+                }
+            )
+        except Exception:
+            pass
+        return
+
+    try:
+        payload = {
+            "type": "answer",
+            "to": viewer_id,
+            "from": STREAMER_ID,
+            "sdp": pc.localDescription.sdp,
+            "type_sdp": pc.localDescription.type,
         }
-        # forward to viewer via signaling server
-        asyncio.ensure_future(ws.send(json.dumps({
-            "type": "forward",
-            "target_role": "viewer",
-            "target_id": viewer_id,
-            "payload": {"action": "candidate", "candidate": cand}
-        })))
+        await ws.send_json(payload)
+        logger.info("sent answer to %s", viewer_id)
+    except Exception:
+        logger.exception("Failed to send answer to %s", viewer_id)
 
-    answer = await pc.createAnswer()
-    await pc.setLocalDescription(answer)
-    return pc.localDescription.sdp
 
-# -------------------------
-# Main run loop
-# -------------------------
-async def run():
-    # detect device path
-    device_path = detect_camera_device(DEVICE_PATH)
-    if not device_path:
-        print("No camera device detected. Exiting.")
-        return
+async def handle_update_request(ws, peer_from: str, data: dict):
+    """
+    Robust update handling:
+    - Prefer exact match by peer_from (viewer id)
+    - Fallback 1: if no peer_from match and exactly one active pc+sender, apply update to that one
+    - Fallback 2: if multiple active pcs and no match, log and optionally reply error ack
+    """
+    global video_source_pool
 
-    # map to index for OpenCV
-    m = re.search(r"/dev/video(\d+)$", device_path)
-    cam_index = 0
-    if m:
-        cam_index = int(m.group(1))
-    print("[main] using device:", device_path, "OpenCV index:", cam_index)
+    viewer_id = peer_from
+    settings = data.get("settings") or {}
+    width = settings.get("width", DEFAULT_WIDTH)
+    height = settings.get("height", DEFAULT_HEIGHT)
+    fps = settings.get("fps", DEFAULT_FPS)
 
-    # detect caps
-    caps = detect_v4l2_caps(device_path)
-    if not caps:
-        caps = detect_opencv_caps(cam_index)
-    caps = sort_caps_desc(caps)
-    print("[main] detected caps (sorted):", caps)
-
-    # choose default mode (prefer 1280x720@30)
-    default_w, default_h, default_fps = choose_default_mode(caps)
-    print("[main] default camera mode chosen:", default_w, default_h, default_fps)
-
-    # create camera source and relay
-    try:
-        camera_source = OpenCVCameraTrack(device_index=cam_index, width=default_w, height=default_h, fps=default_fps)
-    except Exception as e:
-        print("[main] failed to open camera track:", e)
-        return
-    relay = MediaRelay()
-
-    print("[main] connecting to signaling server:", SIGNALING_SERVER)
-    async with websockets.connect(SIGNALING_SERVER) as ws:
-        # register and include caps if available
-        reg_msg = {"type": "register", "role": "streamer", "id": STREAMER_ID}
-        if caps:
-            reg_msg["caps"] = caps
-        await ws.send(json.dumps(reg_msg))
-        print("[main] registered as", STREAMER_ID)
-
-        pcs = {}  # viewer_id -> pc
-
-        async for message in ws:
+    pc = pcs.get(viewer_id)
+    sender = senders.get(viewer_id)
+    if pc is None or sender is None:
+        # fallback strategy
+        active_pairs = [(k, s) for k, s in senders.items() if s is not None]
+        if len(active_pairs) == 1:
+            # single viewer connected -> assume update is for that viewer
+            fallback_viewer, fallback_sender = active_pairs[0]
+            logger.warning(
+                "No existing pc/sender for %s; falling back to single active viewer %s",
+                viewer_id,
+                fallback_viewer,
+            )
+            pc = pcs.get(fallback_viewer)
+            sender = fallback_sender
+            viewer_id = fallback_viewer  # reflect actual target
+        else:
+            logger.warning(
+                "No existing pc/sender for %s when handling update; active viewers: %s; ignoring",
+                viewer_id,
+                list(senders.keys()),
+            )
             try:
-                msg = json.loads(message)
+                await ws.send_json(
+                    {
+                        "type": "error",
+                        "to": data.get("from"),
+                        "from": STREAMER_ID,
+                        "message": "no active pc/sender for requested viewer",
+                    }
+                )
             except Exception:
-                print("[main] received non-json message:", message)
-                continue
+                pass
+            return
 
-            if msg.get("type") != "forward":
-                # ignore other types
-                continue
-
-            from_role = msg.get("from_role")
-            from_id = msg.get("from_id")
-            payload = msg.get("payload", {})
-
-            # ignore messages from self
-            if from_id == STREAMER_ID:
-                continue
-
-            # handle offer
-            if payload.get("action") == "offer":
-                viewer_id = from_id
-                sdp_offer = payload.get("sdp")
-                video_settings = payload.get("video_settings") or {}
-                if not sdp_offer:
-                    print("[main] offer from", viewer_id, "missing sdp")
-                    continue
-
-                pc = RTCPeerConnection()
-                pcs[viewer_id] = pc
-
-                @pc.on("iceconnectionstatechange")
-                def on_ice_state_change():
-                    print(f"[pc:{viewer_id}] ICE state ->", pc.iceConnectionState)
-                    if pc.iceConnectionState in ("failed", "disconnected"):
-                        asyncio.ensure_future(pc.close())
-                        pcs.pop(viewer_id, None)
-
-                print("[main] handling offer from", viewer_id, "settings:", video_settings)
-                answer_sdp = await handle_offer(pc, sdp_offer, ws, viewer_id, relay, camera_source, video_settings)
-                if answer_sdp:
-                    await ws.send(json.dumps({
-                        "type": "forward",
-                        "target_role": "viewer",
-                        "target_id": viewer_id,
-                        "payload": {"action": "answer", "sdp": answer_sdp}
-                    }))
-                    print("[main] sent answer to", viewer_id)
-                else:
-                    print("[main] failed to create answer for", viewer_id)
-
-            # handle candidate
-            elif payload.get("action") == "candidate":
-                viewer_id = from_id
-                candidate_raw = payload.get("candidate")
-                pc = pcs.get(viewer_id)
-                if not pc:
-                    print("[main] no pc for viewer", viewer_id, "- ignoring candidate")
-                    continue
-                cand_init = make_candidate_init_in(candidate_raw)
-                if not cand_init:
-                    print("[main] invalid candidate from", viewer_id, candidate_raw)
-                    continue
-                try:
-                    await pc.addIceCandidate(cand_init)
-                    # debug log
-                    print(f"[main] addIceCandidate OK for {viewer_id}")
-                except Exception as e:
-                    print("[main] addIceCandidate error for", viewer_id, ":", e)
-
-    # cleanup (if ws loop ends)
     try:
-        camera_source.stop()
+        if player is None or relay is None:
+            logger.warning("player/relay not ready for update request")
+            return
+
+        key = pool_key(width, height, fps)
+        if key in track_pool:
+            new_track = track_pool[key]
+            logger.info("Using pooled track for update -> %s", key)
+        else:
+            if key not in video_source_pool:
+                video_source_pool[key] = relay.subscribe(player.video)
+            source = video_source_pool[key]
+            new_track = ScaledVideoTrack(
+                source, width=width, height=height, fps=fps
+            )
+            track_pool[key] = new_track
+            logger.info("Created new pooled track for update -> %s", key)
+
+        # update refcounts: decrease old, increase new
+        old_key = viewer_track_key.get(viewer_id)
+        if old_key and old_key != key:
+            _dec_track_ref(old_key)
+        _inc_track_ref(key)
+        viewer_track_key[viewer_id] = key
+
+        # Try replaceTrack (may return None or coroutine depending on aiortc version)
+        try:
+            res = None
+            try:
+                res = sender.replaceTrack(new_track)
+            except AttributeError:
+                res = None
+
+            if inspect.isawaitable(res):
+                await res
+                logger.info(
+                    "Replaced track for %s using awaitable replaceTrack -> %dx%d@%d",
+                    viewer_id,
+                    width,
+                    height,
+                    fps,
+                )
+            elif res is None:
+                if hasattr(sender, "replaceTrack"):
+                    logger.info(
+                        "Called replaceTrack (sync) for %s -> %dx%d@%d",
+                        viewer_id,
+                        width,
+                        height,
+                        fps,
+                    )
+                else:
+                    logger.info(
+                        "sender.replaceTrack not available, using fallback remove/add for %s",
+                        viewer_id,
+                    )
+                    try:
+                        pc.removeTrack(sender)
+                    except Exception:
+                        logger.debug(
+                            "pc.removeTrack failed or not supported, continuing"
+                        )
+                    new_sender = pc.addTrack(new_track)
+                    senders[viewer_id] = new_sender
+                    logger.info(
+                        "Fallback replaced by remove/add for %s", viewer_id
+                    )
+            else:
+                logger.info(
+                    "replaceTrack returned non-awaitable result for %s: %r",
+                    viewer_id,
+                    res,
+                )
+        except Exception:
+            logger.exception(
+                "Exception while attempting replaceTrack for %s, falling back",
+                viewer_id,
+            )
+            try:
+                pc.removeTrack(sender)
+            except Exception:
+                logger.debug(
+                    "pc.removeTrack failed or not supported in fallback"
+                )
+            new_sender = pc.addTrack(new_track)
+            senders[viewer_id] = new_sender
+            logger.info(
+                "Fallback replaced by remove/add for %s", viewer_id
+            )
+
+        try:
+            await ws.send_json(
+                {
+                    "type": "update_ack",
+                    "to": data.get("from") or viewer_id,
+                    "from": STREAMER_ID,
+                    "settings": {
+                        "width": width,
+                        "height": height,
+                        "fps": fps,
+                    },
+                }
+            )
+        except Exception:
+            pass
+    except Exception:
+        logger.exception("Failed to update track for %s", viewer_id)
+
+
+async def add_candidate_to_pc(pc: RTCPeerConnection, candidate_dict: dict):
+    if candidate_dict is None:
+        await pc.addIceCandidate(None)
+        return
+    try:
+        from aiortc import RTCIceCandidate  # type: ignore
+
+        try:
+            cobj = RTCIceCandidate(
+                sdpMid=candidate_dict.get("sdpMid"),
+                sdpMLineIndex=candidate_dict.get("sdpMLineIndex"),
+                candidate=candidate_dict.get("candidate"),
+            )
+            await pc.addIceCandidate(cobj)
+            return
+        except TypeError:
+            try:
+                cobj = RTCIceCandidate(
+                    candidate_dict.get("sdpMid"),
+                    candidate_dict.get("sdpMLineIndex"),
+                    candidate_dict.get("candidate"),
+                )
+                await pc.addIceCandidate(cobj)
+                return
+            except Exception:
+                pass
     except Exception:
         pass
+    parsed = ParsedIceCandidate(candidate_dict)
+    await pc.addIceCandidate(parsed)
+
+
+async def main():
+    global DEVICE_CAPS
+    devices = list_v4l2_devices()
+    chosen = choose_device_by_keyword(devices, DEVICE_KEYWORDS)
+    if chosen is None:
+        chosen = DEVICE
+    logger.info("Selected device: %s", chosen)
+
+    DEVICE_CAPS = get_device_caps(chosen)
+    logger.info(
+        "Device caps (filtered FPS_MIN=%d): %s", FPS_MIN, DEVICE_CAPS
+    )
+
+    session = aiohttp.ClientSession()
+    try:
+        ws = await session.ws_connect(SIGNALING_URL)
+    except Exception:
+        logger.exception("WS connect failed")
+        await session.close()
+        return
+
+    # register & send caps
+    await ws.send_json({"type": "register", "id": STREAMER_ID})
+    await asyncio.sleep(0.05)
+    await ws.send_json(
+        {
+            "type": "caps",
+            "caps": {"device": chosen, "caps": DEVICE_CAPS},
+        }
+    )
+    logger.info("registered and sent caps")
+
+    # open camera once
+    try:
+        await create_player(
+            chosen,
+            width=DEFAULT_WIDTH,
+            height=DEFAULT_HEIGHT,
+            fps=DEFAULT_FPS,
+        )
+    except Exception:
+        logger.error("Failed to open device")
+        await session.close()
+        return
+
+    async for msg in ws:
+        if msg.type != aiohttp.WSMsgType.TEXT:
+            continue
+        try:
+            data = json.loads(msg.data)
+        except Exception:
+            logger.warning("Invalid JSON: %s", msg.data)
+            continue
+
+        typ = data.get("type")
+        if typ == "offer":
+            peer_from = data.get("from")
+            await handle_offer(ws, peer_from, data, chosen)
+            continue
+        if typ == "candidate":
+            peer_from = data.get("from")
+            candidate = data.get("candidate")
+            if peer_from not in pcs:
+                logger.warning(
+                    "No pc for %s when receiving candidate", peer_from
+                )
+                continue
+            pc = pcs[peer_from]
+            try:
+                await add_candidate_to_pc(pc, candidate)
+            except Exception:
+                logger.exception("addIceCandidate error for %s", peer_from)
+            continue
+        if typ == "request":
+            action = data.get("action")
+            peer_from = data.get("from")
+            if action == "update":
+                await handle_update_request(ws, peer_from, data)
+            else:
+                logger.warning("Unknown request action: %s", action)
+            continue
+        if typ == "update_ack":
+            logger.info("Received update_ack: %s", data.get("settings"))
+            continue
+        if typ == "registered":
+            logger.info("Registered: %s", data.get("id"))
+            continue
+        if typ == "error":
+            logger.error("Signaling error: %s", data.get("message"))
+            continue
+
+    await session.close()
+
+
+def _signal(sig, frame):
+    logger.info("signal received, exiting")
+    try:
+        if player:
+            player.stop()
+    except Exception:
+        pass
+    sys.exit(0)
+
 
 if __name__ == "__main__":
+    signal.signal(signal.SIGINT, _signal)
+    signal.signal(signal.SIGTERM, _signal)
     try:
-        asyncio.run(run())
+        asyncio.run(main())
     except KeyboardInterrupt:
-        print("Interrupted, exiting.")
+        logger.info("Shutting down")

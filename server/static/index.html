@@ -1,0 +1,569 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Viewer — Auto Connect, Auto Reconnect</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    body { font-family: system-ui, Arial, sans-serif; padding: 16px; background:#fafafa; }
+    .player-wrap {
+      width: 960px;
+      max-width: 100%;
+      margin-bottom: 12px;
+      border: 1px solid #ddd;
+      border-radius: 8px;
+      background: #000;
+      display: inline-block;
+      position: relative;
+      overflow: hidden;
+    }
+    video#remote {
+      width: 100%;
+      height: 100%;
+      display: block;
+      object-fit: cover; /* fit border, crop if needed */
+      background: black;
+      border-radius: 6px;
+    }
+    .player-wrap.fixed {
+      height: 540px;
+    }
+    #controls { margin-top: 12px; }
+    select, button { margin: 6px 8px 6px 0; padding:6px; }
+    #log {
+      white-space: pre-wrap;
+      margin-top: 12px;
+      max-height: 240px;
+      overflow:auto;
+      background:#fff;
+      padding:8px;
+      border-radius:6px;
+      border:1px solid #eee;
+      font-size: 12px;
+    }
+    #statusMsg {
+      margin-top: 4px;
+      color: #d00;
+      font-weight: 500;
+      min-height: 1em;
+    }
+    #playOverlay {
+      position:absolute;
+      inset:0;
+      display:none;
+      align-items:center;
+      justify-content:center;
+      background:rgba(0,0,0,0.4);
+    }
+    #playBtn {
+      padding:12px 20px;
+      font-size:18px;
+      border:none;
+      border-radius:8px;
+      cursor:pointer;
+    }
+  </style>
+</head>
+<body>
+  <h2>Viewer — Auto Connect, Auto Reconnect</h2>
+
+  <div>
+    <button id="refreshBtn">Refresh streamers</button>
+    <select id="streamerSelect"></select>
+    <span id="streamerMeta" style="margin-left:8px;font-size:13px;color:#666;"></span>
+  </div>
+
+  <div id="controls">
+    <label>Quality:</label>
+    <select id="qualitySelect"></select>
+    <button id="startBtn">Start viewing</button>
+    <button id="stopBtn" disabled>Stop</button>
+  </div>
+
+  <div id="statusMsg"></div>
+
+  <div class="player-wrap fixed">
+    <video id="remote" autoplay playsinline controls muted></video>
+    <div id="playOverlay">
+      <button id="playBtn">Click to play</button>
+    </div>
+  </div>
+
+  <div id="log"></div>
+
+  <script>
+  (function(){
+    'use strict';
+
+    const logEl = document.getElementById('log');
+    function log() {
+      const msg = Array.from(arguments).join(' ');
+      console.log('[viewer]', msg);
+      if (logEl) {
+        logEl.textContent += msg + '\n';
+        logEl.scrollTop = logEl.scrollHeight;
+      }
+    }
+
+    const SIGNALING_URL = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws';
+
+    let ws = null;
+    let pc = null;
+    const viewerId = 'viewer-' + Math.random().toString(36).slice(2, 9);
+
+    const refreshBtn = document.getElementById('refreshBtn');
+    const streamerSelect = document.getElementById('streamerSelect');
+    const streamerMeta = document.getElementById('streamerMeta');
+    const qualitySelect = document.getElementById('qualitySelect');
+    const startBtn = document.getElementById('startBtn');
+    const stopBtn = document.getElementById('stopBtn');
+    const statusMsg = document.getElementById('statusMsg');
+    const remoteVideo = document.getElementById('remote');
+    const playOverlay = document.getElementById('playOverlay');
+    const playBtn = document.getElementById('playBtn');
+
+    const AUTO_CONNECT = true;
+    const RECONNECT_CONFIG = {
+      maxAttempts: 10
+    };
+    const RECONNECT_DELAY = 1000; // ms
+
+    let CURRENT_STREAMER = null;
+    let CURRENT_SETTINGS = null;
+    let reconnectAttempts = 0;
+    let reconnectTimer = null;
+    let manualStopped = false;
+    let hasStartedOnce = false;
+
+    const STANDARD_HEIGHTS = [1080, 720, 480, 360, 240, 144];
+
+    refreshBtn.addEventListener('click', requestStreamerList);
+    startBtn.addEventListener('click', manualStart);
+    stopBtn.addEventListener('click', stopViewing);
+
+    playBtn.addEventListener('click', async function(){
+      try {
+        remoteVideo.muted = false;
+        await remoteVideo.play();
+        playOverlay.style.display = 'none';
+      } catch (e) {
+        console.warn('Play button failed', e);
+      }
+    });
+
+    function requestStreamerList() {
+      ensureWs();
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'list_streamers' }));
+      } else {
+        setTimeout(requestStreamerList, 200);
+      }
+    }
+
+    function ensureWs() {
+      if (ws && ws.readyState === WebSocket.OPEN) return;
+      ws = new WebSocket(SIGNALING_URL);
+
+      ws.onopen = function() {
+        log('WS connected');
+        reconnectAttempts = 0;
+        manualStopped = false;
+        if (reconnectTimer) {
+          clearTimeout(reconnectTimer);
+          reconnectTimer = null;
+        }
+        if (statusMsg) statusMsg.textContent = '';
+        ws.send(JSON.stringify({ type: 'register', id: viewerId }));
+        requestStreamerList();
+      };
+
+      ws.onmessage = function(evt) {
+        let data;
+        try {
+          data = JSON.parse(evt.data);
+        } catch (e) {
+          log('WS invalid JSON', evt.data);
+          return;
+        }
+        handleSignalingMessage(data);
+      };
+
+      ws.onclose = function() {
+        log('WS closed');
+        if (!manualStopped) {
+          attemptReconnect();
+        }
+      };
+
+      ws.onerror = function(err) {
+        log('WS error', err);
+      };
+    }
+
+    function handleSignalingMessage(data) {
+      log('WS in:', data.type);
+
+      if (data.type === 'streamer_list') {
+        populateStreamerList(data.items || []);
+        if (AUTO_CONNECT && !hasStartedOnce && data.items && data.items.length > 0) {
+          // auto-start with first streamer and current selected quality
+          setTimeout(function(){
+            manualStart();
+          }, 150);
+        }
+        return;
+      }
+
+      if (data.type === 'answer') {
+        if (pc) {
+          try {
+            pc.setRemoteDescription({ type: 'answer', sdp: data.sdp });
+            reconnectAttempts = 0;
+            manualStopped = false;
+            if (statusMsg) statusMsg.textContent = '';
+            log('Remote desc set');
+          } catch (e) {
+            log('setRemoteDescription error', e);
+          }
+        }
+        return;
+      }
+
+      if (data.type === 'candidate') {
+        if (pc && data.candidate) {
+          try {
+            pc.addIceCandidate(data.candidate);
+            log('Added remote candidate');
+          } catch (e) {
+            log('Error adding remote candidate', e);
+          }
+        }
+        return;
+      }
+
+      if (data.type === 'error') {
+        log('Signaling error:', data.message);
+        return;
+      }
+    }
+
+    function populateStreamerList(items) {
+      streamerSelect.innerHTML = '';
+      streamerMeta.textContent = '';
+      qualitySelect.innerHTML = '';
+
+      if (!items || items.length === 0) {
+        streamerSelect.appendChild(new Option('No streamers', ''));
+        return;
+      }
+
+      items.forEach(function(it){
+        const label = it.id + (it.caps && it.caps.device ? ' (' + it.caps.device + ')' : '');
+        streamerSelect.appendChild(new Option(label, it.id));
+      });
+      streamerSelect.selectedIndex = 0;
+
+      const first = items[0];
+      populateQualityForCaps(first && first.caps && first.caps.caps);
+
+      streamerSelect.onchange = function() {
+        const sid = streamerSelect.value;
+        const found = items.find(function(x){ return x.id === sid; });
+        populateQualityForCaps(found && found.caps && found.caps.caps);
+      };
+    }
+
+    function populateQualityForCaps(caps) {
+      qualitySelect.innerHTML = '';
+      if (!caps || !Array.isArray(caps)) return;
+
+      const options = buildQualityOptionsFromCaps(caps);
+      if (options.length === 0) {
+        // fallback simple list
+        caps.forEach(function(c){
+          (c.fps_list || []).forEach(function(fps){
+            const v = c.width + 'x' + c.height + '@' + fps;
+            qualitySelect.appendChild(new Option(v, v));
+          });
+        });
+        return;
+      }
+
+      options.forEach(function(o){
+        qualitySelect.appendChild(new Option(o.label, o.value));
+      });
+
+      // 🔥 ưu tiên giữ lại CURRENT_SETTINGS nếu có
+      let preferredIndex = 0;
+      if (CURRENT_SETTINGS) {
+        const want = CURRENT_SETTINGS.width + 'x' +
+                     CURRENT_SETTINGS.height + '@' +
+                     CURRENT_SETTINGS.fps;
+        for (let i = 0; i < qualitySelect.options.length; i++) {
+          if (qualitySelect.options[i].value === want) {
+            preferredIndex = i;
+            break;
+          }
+        }
+      } else {
+        // nếu chưa có CURRENT_SETTINGS thì ưu tiên 720p@30, nếu có
+        for (let i = 0; i < qualitySelect.options.length; i++) {
+          if (qualitySelect.options[i].text.indexOf('720p@30') === 0) {
+            preferredIndex = i;
+            break;
+          }
+        }
+      }
+      qualitySelect.selectedIndex = preferredIndex;
+    }
+
+    function buildQualityOptionsFromCaps(caps) {
+      const out = [];
+      const YT_SIZES = {
+        1080: { w: 1920, h: 1080 },
+        720:  { w: 1280, h: 720 },
+        480:  { w: 854,  h: 480 },
+        360:  { w: 640,  h: 360 },
+        240:  { w: 426,  h: 240 },
+        144:  { w: 256,  h: 144 }
+      };
+
+      STANDARD_HEIGHTS.forEach(function(stdH){
+        const candidates = caps.filter(function(c){ return c.height >= stdH; });
+        if (candidates.length === 0) return;
+
+        const target = YT_SIZES[stdH] || { w: Math.round(stdH * 16 / 9), h: stdH };
+
+        const fpsSet = new Set();
+        candidates.forEach(function(c){
+          (c.fps_list || []).forEach(function(fps){
+            fpsSet.add(fps);
+          });
+        });
+
+        Array.from(fpsSet).sort(function(a,b){ return b - a; }).forEach(function(fps){
+          const label = stdH + 'p@' + fps + ' (' + target.w + 'x' + target.h + ')';
+          const value = target.w + 'x' + target.h + '@' + fps;
+          out.push({
+            label: label,
+            value: value,
+            stdH: stdH,
+            fps: fps,
+            width: target.w,
+            height: target.h
+          });
+        });
+      });
+
+      return out;
+    }
+
+    function parseQuality(val) {
+      // "WIDTHxHEIGHT@FPS"
+      const m = val.match(/^(\d+)x(\d+)@(\d+)$/);
+      if (!m) return null;
+      return {
+        width: parseInt(m[1], 10),
+        height: parseInt(m[2], 10),
+        fps: parseInt(m[3], 10)
+      };
+    }
+
+    function manualStart() {
+      const sid = streamerSelect.value;
+      if (!sid) {
+        log('No streamer selected');
+        return;
+      }
+      const val = qualitySelect.value;
+      const q = parseQuality(val);
+      if (!q) {
+        log('Invalid quality value', val);
+        return;
+      }
+      startViewing(sid, q);
+      hasStartedOnce = true;
+      startBtn.disabled = true;
+      stopBtn.disabled = false;
+    }
+
+    function stopViewing() {
+      if (pc) {
+        try { pc.close(); } catch (e) {}
+      }
+      pc = null;
+      manualStopped = true;
+      startBtn.disabled = false;
+      stopBtn.disabled = true;
+      if (statusMsg) statusMsg.textContent = 'Stopped by user.';
+      log('Stopped');
+    }
+
+    async function startViewing(streamerId, settings) {
+      ensureWs();
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        log('WS not ready yet, cannot start');
+        return;
+      }
+
+      if (pc) {
+        try { pc.close(); } catch (e) {}
+        pc = null;
+      }
+
+      pc = new RTCPeerConnection({}); // LAN-only, no STUN/TURN
+
+      pc.oniceconnectionstatechange = function() {
+        log('ICE state:', pc.iceConnectionState);
+        if (pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'disconnected') {
+          if (!manualStopped) {
+            attemptReconnect();
+          }
+        }
+      };
+
+      pc.onicecandidate = function(e) {
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+        const candidate = e.candidate ? {
+          candidate: e.candidate.candidate,
+          sdpMid: e.candidate.sdpMid,
+          sdpMLineIndex: e.candidate.sdpMLineIndex
+        } : null;
+        ws.send(JSON.stringify({
+          type: 'candidate',
+          to: streamerId,
+          from: viewerId,
+          candidate: candidate
+        }));
+      };
+
+      pc.ontrack = function(ev) {
+        onRemoteTrack(ev);
+      };
+
+      // recvonly
+      pc.addTransceiver('video', { direction: 'recvonly' });
+
+      let offer;
+      try {
+        offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+      } catch (e) {
+        log('Error creating offer', e);
+        return;
+      }
+
+      CURRENT_STREAMER = streamerId;
+      CURRENT_SETTINGS = settings;
+
+      ws.send(JSON.stringify({
+        type: 'offer',
+        to: streamerId,
+        from: viewerId,
+        sdp: offer.sdp,
+        type_sdp: offer.type,
+        settings: settings
+      }));
+      log('Offer sent with settings', JSON.stringify(settings));
+
+      qualitySelect.onchange = function() {
+        if (!pc || !ws || ws.readyState !== WebSocket.OPEN) return;
+        const val = qualitySelect.value;
+        const q = parseQuality(val);
+        if (!q) return;
+
+        // 🔥 lưu lại setting hiện tại để reconnect dùng đúng resolution đang xem
+        CURRENT_SETTINGS = q;
+
+        ws.send(JSON.stringify({
+          type: 'request',
+          action: 'update',
+          to: streamerId,
+          from: viewerId,
+          settings: q
+        }));
+        log('Sent update request', JSON.stringify(q));
+      };
+    }
+
+    function onRemoteTrack(ev) {
+      log('ontrack');
+      try {
+        remoteVideo.muted = true; // to allow autoplay
+        if (ev.streams && ev.streams[0]) {
+          remoteVideo.srcObject = ev.streams[0];
+        } else {
+          const ms = new MediaStream();
+          ms.addTrack(ev.track);
+          remoteVideo.srcObject = ms;
+        }
+      } catch (e) {
+        console.warn('Error attaching remote stream', e);
+      }
+
+      tryPlay(remoteVideo);
+    }
+
+    async function tryPlay(videoEl) {
+      try {
+        await videoEl.play();
+        playOverlay.style.display = 'none';
+        log('Autoplay OK');
+      } catch (err) {
+        log('Autoplay blocked, waiting for user gesture');
+        playOverlay.style.display = 'flex';
+      }
+    }
+
+    function attemptReconnect() {
+      if (manualStopped) {
+        log('Manual stop, no reconnect');
+        return;
+      }
+      if (!CURRENT_STREAMER || !CURRENT_SETTINGS) {
+        log('No active session to reconnect');
+        return;
+      }
+      if (reconnectTimer) {
+        return;
+      }
+      if (reconnectAttempts >= RECONNECT_CONFIG.maxAttempts) {
+        log('Max reconnect attempts reached:', reconnectAttempts);
+        if (statusMsg) {
+          statusMsg.textContent = 'Disconnected: failed to reconnect after ' + reconnectAttempts + ' attempts.';
+        }
+        if (logEl) {
+          logEl.textContent += '\n[DISCONNECTED] Reconnect failed after ' +
+            reconnectAttempts + ' attempts.\n';
+        }
+        try {
+          if (pc) { pc.close(); }
+        } catch (e) {}
+        pc = null;
+        manualStopped = true;
+        return;
+      }
+
+      reconnectAttempts += 1;
+      log('Scheduling reconnect attempt', reconnectAttempts, 'in', RECONNECT_DELAY, 'ms (max', RECONNECT_CONFIG.maxAttempts + ')');
+
+      reconnectTimer = setTimeout(function(){
+        reconnectTimer = null;
+        try {
+          if (pc) { pc.close(); }
+        } catch (e) {}
+        pc = null;
+        log('Reconnecting to', CURRENT_STREAMER, 'with settings', JSON.stringify(CURRENT_SETTINGS));
+        ensureWs();
+        setTimeout(function(){
+          startViewing(CURRENT_STREAMER, CURRENT_SETTINGS);
+        }, 500);
+      }, RECONNECT_DELAY);
+    }
+
+    // Init
+    ensureWs();
+  })();
+  </script>
+</body>
+</html>
